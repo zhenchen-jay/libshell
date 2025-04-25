@@ -7,6 +7,7 @@
 #include "../include/LineSearch.h"
 #include "../include/NewtonDescent.h"
 #include "../include/Timer.h"
+#include "../include/AccelerateSupport.h"
 
 namespace OptSolver {
 // Newton solver with line search
@@ -22,9 +23,6 @@ void NewtonSolver(
     bool display_info,
     bool is_swap) {
     const int DIM = x0.rows();
-    // Eigen::VectorXd randomVec = x0;
-    // randomVec.setRandom();
-    // x0 += 1e-6 * randomVec;
     Eigen::VectorXd grad = Eigen::VectorXd::Zero(DIM);
     Eigen::SparseMatrix<double> hessian;
 
@@ -64,6 +62,7 @@ void NewtonSolver(
 
     bool is_small_perturb_needed = false;
 
+
     for (; i < num_iter; i++) {
         if (display_info) {
             spdlog::debug("iter: {}, ||x||: {}", i, x0.norm());
@@ -78,25 +77,30 @@ void NewtonSolver(
 
         local_timer.start();
         Eigen::SparseMatrix<double> H = hessian;
-        spdlog::debug("num of nonzeros: {}, rows: {}, cols: {}, Sparsity: {}%", H.nonZeros(), H.rows(), H.cols(),
+        spdlog::debug("|H|: {}, num of nonzeros: {}, rows: {}, cols: {}, Sparsity: {}%", H.norm(), H.nonZeros(), H.rows(), H.cols(),
                       H.nonZeros() * 100.0 / (H.rows() * H.cols()));
-
-        if (is_small_perturb_needed && is_proj) {
-            // due to the numerical issue, we may need to add a small perturbation to
-            // the PSD projected hessian matrix
-            H += reg * I;
+        if (std::isnan(H.norm())) {
+            spdlog::error("Hessian is nan! Terminate the solver...");
+            return;
         }
 
-        Eigen::SparseMatrix<double> HT = H.transpose();
-        Eigen::SimplicialLLT<Eigen::SparseMatrix<double>> solver(H);
+        if (is_small_perturb_needed && is_proj) {
+            H += reg * I;
+        }
+#ifdef OPT_SOLVER_ACCELERATE
+        spdlog::debug("Using Accelerate for linear solver");
+        AccelerateLLT<Eigen::SparseMatrix<double>> solver;
+#else
+        spdlog::debug("Using Eigen for linear solver");
+        Eigen::SimplicialLLT<Eigen::SparseMatrix<double>> solver;
+#endif
 
-        while (solver.info() != Eigen::Success) {
+        solver.compute(H);
+        if (solver.info() != Eigen::Success) {
             if (display_info) {
                 if (is_proj) {
                     spdlog::debug("some small perturb is needed to remove round-off error, current reg = {}", reg);
-                }
-
-                else {
+                } else {
                     spdlog::debug("Matrix is not positive definite, current reg = {}", reg);
                 }
             }
@@ -108,13 +112,6 @@ void NewtonSolver(
             H = hessian + reg * I;
             solver.compute(H);
             reg = std::max(2 * reg, 1e-16);
-
-            // if (reg > 1e4 && is_proj_hess) {
-            //     spdlog::debug("reg is too large, use SPD hessian instead.");
-            //     reg = 1e-6;
-            //     is_proj = true;
-            //     f = obj_func(x0, &grad, &hessian, is_proj);
-            // }
         }
 
         neg_grad = -grad;
@@ -139,7 +136,7 @@ void NewtonSolver(
             reg = 1e-8;
         }
 
-        if(delta_x.hasNaN()) {
+        if (delta_x.hasNaN()) {
             spdlog::error("Descent direction has nan! Terminate the solver...");
             return;
         }
@@ -150,8 +147,8 @@ void NewtonSolver(
 
         if (display_info) {
             spdlog::debug("line search rate : {}, actual hessian : {}, reg = {}", rate, !is_proj, reg);
-            spdlog::debug("f_old: {}, f_new: {}, grad norm: {}, newton dec: {}, delta_x : {}, delta_f: {}", f, fnew, grad.norm(),
-                          delta_x.norm(), rate * delta_x.norm(), f - fnew);
+            spdlog::debug("f_old: {}, f_new: {}, grad norm: {}, newton dec: {}, delta_x : {}, delta_f: {}", f, fnew,
+                          grad.norm(), delta_x.norm(), rate * delta_x.norm(), f - fnew);
             spdlog::debug("timing info (in total seconds): ");
             spdlog::debug("assembling took: {}, LLT solver took: {}, line search took: {}\n", total_assembling_time,
                           total_solving_time, total_linesearch_time);
@@ -159,16 +156,12 @@ void NewtonSolver(
 
         double switch_tol = 1e-4;
 
-        // switch to the actual hessian when close to convergence
         if (is_swap) {
-            // this is just some experience value, you can change it
             if (delta_x.norm() < switch_tol) {
                 is_proj = false;
             }
         }
-        
 
-        // Termination conditions
         if (rate < 1e-8) {
             spdlog::info("terminate with small line search rate (<1e-8): L2-norm = {}", grad.norm());
             break;

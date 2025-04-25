@@ -48,6 +48,15 @@ target_link_libraries(pin_cloth ${PROJECT_NAME}
             polyscope
             CLI11::CLI11)
 
+add_executable(punched_disk punched_disk_demo.cpp ${SRCFILES})
+# other dependencies
+target_link_libraries(punched_disk ${PROJECT_NAME}
+            optimization
+            igl::core
+            igl_restricted::triangle 
+            polyscope
+            CLI11::CLI11)
+
 # Use C++14
 set_target_properties(${PROJECT_NAME} PROPERTIES CXX_STANDARD 14)
 set_target_properties(${PROJECT_NAME} PROPERTIES CXX_STANDARD_REQUIRED ON)
