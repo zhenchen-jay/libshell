@@ -890,10 +890,9 @@ public:
             if (hessian) {
                 for (auto it : bendingMcoeffs_) hessian->push_back(it);
             }
-
-            return result;
         }
 
+        return result;
     }
 
     virtual std::vector<double> elasticEnergyPerElement(const Eigen::MatrixXd& curPos,

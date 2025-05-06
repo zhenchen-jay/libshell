@@ -57,6 +57,50 @@ target_link_libraries(punched_disk ${PROJECT_NAME}
             polyscope
             CLI11::CLI11)
 
+add_executable(punched_disk_with_external_force punched_disk_with_external_force_demo.cpp ${SRCFILES})
+# other dependencies
+target_link_libraries(punched_disk_with_external_force ${PROJECT_NAME}
+            optimization
+            igl::core
+            igl_restricted::triangle 
+            polyscope
+            CLI11::CLI11)
+
+add_executable(punched_disk_initial_curved punched_disk_initial_curved_demo.cpp ${SRCFILES})
+# other dependencies
+target_link_libraries(punched_disk_initial_curved ${PROJECT_NAME}
+            optimization
+            igl::core
+            igl_restricted::triangle 
+            polyscope
+            CLI11::CLI11)
+
+add_executable(visualize_res visualize_res.cpp ${SRCFILES})     
+# other dependencies
+target_link_libraries(visualize_res ${PROJECT_NAME}
+            optimization
+            igl::core
+            igl_restricted::triangle 
+            polyscope
+            CLI11::CLI11)
+
+add_executable(result_comp result_comp.cpp ${SRCFILES})     
+# other dependencies
+target_link_libraries(result_comp ${PROJECT_NAME}
+            optimization
+            igl::core
+            igl_restricted::triangle 
+            polyscope
+            CLI11::CLI11)
+
+add_executable(result_comp_seq result_comp_seq.cpp ${SRCFILES})     
+# other dependencies
+target_link_libraries(result_comp_seq ${PROJECT_NAME}
+            optimization
+            igl::core
+            igl_restricted::triangle 
+            polyscope
+            CLI11::CLI11)
 # Use C++14
 set_target_properties(${PROJECT_NAME} PROPERTIES CXX_STANDARD 14)
 set_target_properties(${PROJECT_NAME} PROPERTIES CXX_STANDARD_REQUIRED ON)

@@ -21,7 +21,8 @@ void NewtonSolver(
     double f_tol,
     bool is_proj_hess,
     bool display_info,
-    bool is_swap) {
+    bool is_swap,
+    NewtonSolverLog *log) {
     const int DIM = x0.rows();
     Eigen::VectorXd grad = Eigen::VectorXd::Zero(DIM);
     Eigen::SparseMatrix<double> hessian;
@@ -49,6 +50,16 @@ void NewtonSolver(
             "Termination Creteria, gradient tolerance: {}, function update tolerance: {}, variable update tolerance: "
             "{}, maximum iteration: {}\n",
             grad_tol, f_tol, x_tol, num_iter);
+    }
+    if (log != nullptr) {
+        log->energy = 0;
+        log->grad_norm = 0;
+        log->x_norm = 0;
+        log->f_norm = 0;
+        log->newton_dec = 0;
+        log->line_search_step_size = 0;
+        log->terminate_iter = 0;
+        log->is_converged = true;
     }
     int i = 0;
 
@@ -162,6 +173,17 @@ void NewtonSolver(
             }
         }
 
+        if (log != nullptr) {
+            log->energy = fnew;
+            log->grad_norm = grad.norm();
+            log->x_norm = x0.norm();
+            log->f_norm = fnew;
+            log->newton_dec = delta_x.norm();
+            log->line_search_step_size = rate;
+            log->terminate_iter = i;
+            log->is_converged = false;
+        }
+
         if (rate < 1e-8) {
             spdlog::info("terminate with small line search rate (<1e-8): L2-norm = {}", grad.norm());
             break;
@@ -169,6 +191,17 @@ void NewtonSolver(
 
         if (grad.norm() < grad_tol) {
             spdlog::info("terminate with gradient L2-norm = {}", grad.norm());
+            if (log != nullptr) {
+                log->is_converged = true;
+            }
+            break;
+        }
+
+        if (delta_x.norm() < grad_tol) {
+            spdlog::info("terminate with small newton decrement, decrement L2-norm = {}", delta_x.norm());
+            if (log != nullptr) {
+                log->is_converged = true;
+            }
             break;
         }
 
