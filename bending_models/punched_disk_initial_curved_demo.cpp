@@ -16,6 +16,9 @@
 #include "../include/ExtraEnergyTermsGeneralTanFormulation.h"
 #include "../include/ExtraEnergyTermsSinFormulation.h"
 #include "../include/ExtraEnergyTermsTanFormulation.h"
+#include <tuple>
+#include <utility>     // For std::tie
+#include <filesystem>  // For std::filesystem
 
 #include "../Optimization/include/NewtonDescent.h"
 #include "../src/GeometryDerivatives.h"
@@ -25,6 +28,7 @@
 #include "make_geometric_shapes/HalfCylinder.h"
 #include "make_geometric_shapes/Cylinder.h"
 #include "make_geometric_shapes/Sphere.h"
+#include "make_geometric_shapes/PunchDisk.h"
 #include "spdlog/fmt/bundled/chrono.h"
 
 #include <polyscope/surface_vector_quantity.h>
@@ -44,8 +48,63 @@
 enum class SFFModelType { kS1Sin, kS1Tan, kS2Sin };
 enum class MaterialType { kStVK, kNeoHookean };
 
-bool is_include_III = false;
-int num_iters = 200;
+bool is_include_III = true;
+double inner_radius = 0.1;
+double middle_radius = 0.4;
+double outer_radius = 0.5;
+int num_iters = 5000;
+
+std::vector<int> fixed_verts;
+
+double target_height = 0.2;
+double shell_thickness = 1e-3;
+
+struct OptimizationLog {
+    OptSolver::NewtonSolverLog log;
+    double membrane_energy = 0;
+    double bending_energy = 0;
+    double III_energy = 0;
+    double mag_comp_energy = 0;
+    double direct_perp_energy = 0;
+    double total_energy = 0;
+
+    void print() {
+        std::cout << "=== Newton solver log: \n"
+                  << "- energy: " << log.energy << "\n"
+                  << "- grad_norm: " << log.grad_norm << "\n"
+                  << "- x_norm: " << log.x_norm << "\n"
+                  << "- f_norm: " << log.f_norm << "\n"
+                  << "- newton_dec: " << log.newton_dec << "\n"
+                  << "- line_search_step_size: " << log.line_search_step_size << "\n"
+                  << "- terminate_iter: " << log.terminate_iter << "\n"
+                  << "- is_converged: " << log.is_converged << std::endl;
+        std::cout << "=== Total energy: " << total_energy << std::endl;
+        std::cout << "- membrane energy: " << membrane_energy << std::endl;
+        std::cout << "- bending energy: " << bending_energy << std::endl;
+        std::cout << "- III energy: " << III_energy << std::endl;
+        std::cout << "- mag comp energy: " << mag_comp_energy << std::endl;
+        std::cout << "- direct perp energy: " << direct_perp_energy << std::endl;
+    }
+
+    void save(const std::string& filename) {
+        std::ofstream file(filename);
+        file << "=== Newton solver log: \n"
+             << "- energy: " << log.energy << "\n"
+             << "- grad_norm: " << log.grad_norm << "\n"
+             << "- x_norm: " << log.x_norm << "\n"
+             << "- f_norm: " << log.f_norm << "\n"
+             << "- newton_dec: " << log.newton_dec << "\n"
+             << "- line_search_step_size: " << log.line_search_step_size << "\n"
+             << "- terminate_iter: " << log.terminate_iter << "\n"
+             << "- is_converged: " << log.is_converged << "\n";
+        file << "=== Total energy: " << total_energy << "\n";
+        file << "- membrane energy: " << membrane_energy << "\n";
+        file << "- bending energy: " << bending_energy << "\n";
+        file << "- III energy: " << III_energy << "\n";
+        file << "- mag comp energy: " << mag_comp_energy << "\n";
+        file << "- direct perp energy: " << direct_perp_energy << "\n";
+    }
+};
 
 void lameParameters(double youngs, double poisson, double& alpha, double& beta) {
     alpha = youngs * poisson / (1.0 - poisson * poisson);
@@ -68,15 +127,27 @@ std::vector<Eigen::Vector3d> get_face_edge_normal_vectors(const Eigen::MatrixXd&
     return face_edge_normals;
 }
 
-void optimizeFullDOFs(
-    ShellEnergy& energy,
-    const std::vector<Eigen::Matrix2d>& abars,
-    const LibShell::MeshConnectivity& cur_mesh,
-    Eigen::MatrixXd& cur_pos,
-    Eigen::VectorXd& cur_edge_dofs,
-    std::shared_ptr<LibShell::ExtraEnergyTermsBase> extra_energy_terms = nullptr,
-    const std::unordered_map<int, double>* fixed_vert_dofs = nullptr,
-    const std::unordered_set<int>* fixed_edge_dofs = nullptr) {
+std::unordered_map<int, double> build_boundary_fixed_vertex_map(const Eigen::MatrixXd& cur_pos,
+                                                                const LibShell::MeshConnectivity& mesh) {
+    std::unordered_map<int, double> fixed_vertex_dofs;
+    for (auto id : fixed_verts) {
+        for (int j = 0; j < 3; j++) {
+            fixed_vertex_dofs[3 * id + j] = cur_pos(id, j);
+        }
+    }
+
+    return fixed_vertex_dofs;
+}
+
+void optimizeFullDOFs(ShellEnergy& energy,
+                      const std::vector<Eigen::Matrix2d>& abars,
+                      const LibShell::MeshConnectivity& cur_mesh,
+                      Eigen::MatrixXd& cur_pos,
+                      Eigen::VectorXd& cur_edge_dofs,
+                      std::shared_ptr<LibShell::ExtraEnergyTermsBase> extra_energy_terms = nullptr,
+                      const std::unordered_map<int, double>* fixed_vert_dofs = nullptr,
+                      const std::unordered_set<int>* fixed_edge_dofs = nullptr,
+                      OptimizationLog* opt_log = nullptr) {
     double tol = 1e-5;
     int nposdofs = cur_pos.rows() * 3;
     int nedgedofs = cur_edge_dofs.size();
@@ -184,12 +255,14 @@ void optimizeFullDOFs(
             std::vector<Eigen::Triplet<double>> mag_comp_triplets, direct_perp_triplets, III_triplets;
 
             double mag_comp = extra_energy_terms->compute_magnitude_compression_energy(
-                edge_dofs, cur_mesh, grad ? &mag_comp_deriv : nullptr, hessian ? &mag_comp_triplets : nullptr, psd_proj);
+                edge_dofs, cur_mesh, grad ? &mag_comp_deriv : nullptr, hessian ? &mag_comp_triplets : nullptr,
+                psd_proj);
             double direct_perp = extra_energy_terms->compute_vector_perp_tangent_energy(
                 pos, edge_dofs, cur_mesh, abars, grad ? &direct_perp_deriv : nullptr,
                 hessian ? &direct_perp_triplets : nullptr, psd_proj);
             double III = extra_energy_terms->compute_thirdFundamentalForm_energy(
-                pos, edge_dofs, cur_mesh, abars, grad ? &III_deriv : nullptr, hessian ? &III_triplets : nullptr, psd_proj);
+                pos, edge_dofs, cur_mesh, abars, grad ? &III_deriv : nullptr, hessian ? &III_triplets : nullptr,
+                psd_proj);
 
             total_energy += mag_comp;
             total_energy += direct_perp;
@@ -254,10 +327,10 @@ void optimizeFullDOFs(
     if (extra_energy_terms) {
         double mag_comp =
             extra_energy_terms->compute_magnitude_compression_energy(cur_edge_dofs, cur_mesh, nullptr, nullptr, false);
-        double direct_perp = extra_energy_terms->compute_vector_perp_tangent_energy(cur_pos, cur_edge_dofs, cur_mesh, abars,
-                                                                                    nullptr, nullptr, false);
-        double III_term = extra_energy_terms->compute_thirdFundamentalForm_energy(cur_pos, cur_edge_dofs, cur_mesh, abars,
-                                                                                  nullptr, nullptr, false);
+        double direct_perp = extra_energy_terms->compute_vector_perp_tangent_energy(cur_pos, cur_edge_dofs, cur_mesh,
+                                                                                    abars, nullptr, nullptr, false);
+        double III_term = extra_energy_terms->compute_thirdFundamentalForm_energy(cur_pos, cur_edge_dofs, cur_mesh,
+                                                                                  abars, nullptr, nullptr, false);
 
         std::cout << "||m^2 - 1||^2: " << mag_comp << std::endl;
         std::cout << "direct perp: " << direct_perp << std::endl;
@@ -267,7 +340,13 @@ void optimizeFullDOFs(
     Eigen::VectorXd x = convert_pos_edge_dofs_2_var(cur_pos, cur_edge_dofs);
     OptSolver::TestFuncGradHessian(obj_func, x);
 
-    OptSolver::NewtonSolver(obj_func, find_max_step, x, num_iters, tol, 1e-15, 1e-15, true, true, true);
+    OptSolver::NewtonSolverLog log;
+
+    OptSolver::NewtonSolver(obj_func, find_max_step, x, num_iters, tol, 1e-15, 1e-15, true, true, true, &log);
+
+    if (opt_log) {
+        opt_log->log = log;
+    }
 
     std::tie(cur_pos, cur_edge_dofs) = convert_var_2_pos_edge_dofs(x);
 
@@ -278,31 +357,46 @@ void optimizeFullDOFs(
               << "bending energy: " << energy.elasticEnergy(cur_pos, cur_edge_dofs, false, true, NULL, NULL)
               << std::endl;
 
+    if (opt_log) {
+        opt_log->membrane_energy = energy.elasticEnergy(cur_pos, cur_edge_dofs, true, false, NULL, NULL);
+        opt_log->bending_energy = energy.elasticEnergy(cur_pos, cur_edge_dofs, false, true, NULL, NULL);
+    }
+
     if (extra_energy_terms) {
         double mag_comp =
             extra_energy_terms->compute_magnitude_compression_energy(cur_edge_dofs, cur_mesh, nullptr, nullptr, false);
-        double direct_perp = extra_energy_terms->compute_vector_perp_tangent_energy(cur_pos, cur_edge_dofs, cur_mesh, abars,
-                                                                                    nullptr, nullptr, false);
-        double III_term = extra_energy_terms->compute_thirdFundamentalForm_energy(cur_pos, cur_edge_dofs, cur_mesh, abars,
-                                                                                  nullptr, nullptr, false);
+        double direct_perp = extra_energy_terms->compute_vector_perp_tangent_energy(cur_pos, cur_edge_dofs, cur_mesh,
+                                                                                    abars, nullptr, nullptr, false);
+        double III_term = extra_energy_terms->compute_thirdFundamentalForm_energy(cur_pos, cur_edge_dofs, cur_mesh,
+                                                                                  abars, nullptr, nullptr, false);
         std::cout << "||m^2 - 1||^2: " << mag_comp << std::endl;
         std::cout << "direct perp: " << direct_perp << std::endl;
         std::cout << "III: " << III_term << std::endl;
+
+        if (opt_log) {
+            opt_log->mag_comp_energy = mag_comp;
+            opt_log->direct_perp_energy = direct_perp;
+            opt_log->III_energy = III_term;
+        }
+    }
+
+    if (opt_log) {
+        opt_log->total_energy = opt_log->membrane_energy + opt_log->bending_energy + opt_log->mag_comp_energy +
+                                opt_log->direct_perp_energy + opt_log->III_energy;
     }
 }
 
 std::pair<std::shared_ptr<ShellEnergy>, std::shared_ptr<LibShell::ExtraEnergyTermsBase>> initialization(
     const LibShell::MeshConnectivity& rest_mesh,
     const Eigen::MatrixXd& rest_pos,
-    const LibShell::MeshConnectivity& cur_mesh,     // we need this since we will stitch to get the current intial mesh
+    const LibShell::MeshConnectivity& cur_mesh,  // we need this since we will stitch to get the current intial mesh
     double thickness,
     double young,
     double poisson,
     Eigen::VectorXd& edge_dofs,
     LibShell::MonolayerRestState& rest_state,
     SFFModelType model_type,
-    MaterialType material_type)
-{
+    MaterialType material_type) {
     rest_state.abars.clear();
     rest_state.thicknesses.clear();
     rest_state.bbars.clear();
@@ -368,26 +462,16 @@ std::pair<std::shared_ptr<ShellEnergy>, std::shared_ptr<LibShell::ExtraEnergyTer
     return {dir_energy_model, extra_energy_terms};
 }
 
-void processFullModelOneStep(const LibShell::MeshConnectivity& rest_mesh,
-                             const LibShell::MonolayerRestState& rest_state,
-                             const LibShell::MeshConnectivity& cur_mesh,
-                             const std::shared_ptr<ShellEnergy> stvk_dir_energy_model,
-                             const std::shared_ptr<LibShell::ExtraEnergyTermsBase> extra_energy_terms,
-                             Eigen::MatrixXd& cur_pos,
-                             Eigen::VectorXd& cur_edge_dofs,
-                             SFFModelType model_type) {
+OptimizationLog processFullModelOneStep(const LibShell::MeshConnectivity& rest_mesh,
+                                        const LibShell::MonolayerRestState& rest_state,
+                                        const LibShell::MeshConnectivity& cur_mesh,
+                                        const std::shared_ptr<ShellEnergy> stvk_dir_energy_model,
+                                        const std::shared_ptr<LibShell::ExtraEnergyTermsBase> extra_energy_terms,
+                                        Eigen::MatrixXd& cur_pos,
+                                        Eigen::VectorXd& cur_edge_dofs,
+                                        SFFModelType model_type) {
     std::unordered_map<int, double> cur_bnd_condition;
-
-    for(int i = 0; i < cur_mesh.nEdges(); i++) {
-        if(cur_mesh.edgeFace(i, 0) == -1 || cur_mesh.edgeFace(i, 1) == -1) {
-            for(int k = 0 ; k < 2; k++) {
-                int vid = cur_mesh.edgeVertex(i, k);
-                for(int j = 0; j < 3; j++) {
-                    cur_bnd_condition[3 * vid + j] = cur_pos(vid, j);
-                }
-            }
-        }
-    }
+    cur_bnd_condition = build_boundary_fixed_vertex_map(cur_pos, cur_mesh);
 
     switch (model_type) {
         case SFFModelType::kS1Sin:
@@ -400,13 +484,20 @@ void processFullModelOneStep(const LibShell::MeshConnectivity& rest_mesh,
             std::cout << "============= Optimizing edge direction (S2 Sin) =========== " << std::endl;
             break;
     }
-    optimizeFullDOFs(*stvk_dir_energy_model, rest_state.abars, cur_mesh, cur_pos, cur_edge_dofs,
-                     extra_energy_terms, cur_bnd_condition.empty() ? nullptr : &cur_bnd_condition, nullptr);
+    OptimizationLog opt_log;
+    optimizeFullDOFs(*stvk_dir_energy_model, rest_state.abars, cur_mesh, cur_pos, cur_edge_dofs, extra_energy_terms,
+                     cur_bnd_condition.empty() ? nullptr : &cur_bnd_condition, nullptr, &opt_log);
+    return opt_log;
 }
 
-void update_rendering(polyscope::SurfaceMesh* cur_surface_mesh, polyscope::PointCloud* pt_mesh, const std::shared_ptr<ShellEnergy> stvk_dir_energy_model,
-                             const std::shared_ptr<LibShell::ExtraEnergyTermsBase> extra_energy_terms,
-                      const LibShell::MeshConnectivity& cur_mesh, const LibShell::MonolayerRestState& rest_state, const Eigen::MatrixXd& cur_pos, const Eigen::VectorXd& cur_edge_dofs,
+void update_rendering(polyscope::SurfaceMesh* cur_surface_mesh,
+                      polyscope::PointCloud* pt_mesh,
+                      const std::shared_ptr<ShellEnergy> stvk_dir_energy_model,
+                      const std::shared_ptr<LibShell::ExtraEnergyTermsBase> extra_energy_terms,
+                      const LibShell::MeshConnectivity& cur_mesh,
+                      const LibShell::MonolayerRestState& rest_state,
+                      const Eigen::MatrixXd& cur_pos,
+                      const Eigen::VectorXd& cur_edge_dofs,
                       SFFModelType model_type) {
     std::vector<Eigen::Vector3d> face_edge_midpts = {};
     for (int i = 0; i < cur_mesh.nFaces(); i++) {
@@ -424,9 +515,8 @@ void update_rendering(polyscope::SurfaceMesh* cur_surface_mesh, polyscope::Point
     Eigen::VectorXd edge_dofs;
     std::string model_name;
     switch (model_type) {
-        case SFFModelType::kS1Sin: 
-        case SFFModelType::kS1Tan: 
-        {
+        case SFFModelType::kS1Sin:
+        case SFFModelType::kS1Tan: {
             edge_dofs.resize(2 * cur_mesh.nEdges());
             for (int i = 0; i < cur_mesh.nEdges(); i++) {
                 edge_dofs(2 * i) = cur_edge_dofs(i);
@@ -444,17 +534,17 @@ void update_rendering(polyscope::SurfaceMesh* cur_surface_mesh, polyscope::Point
             return;
         }
     }
-    std::vector<Eigen::Vector3d> face_edge_normals =
-            get_face_edge_normal_vectors(cur_pos, cur_mesh, edge_dofs);
+    std::vector<Eigen::Vector3d> face_edge_normals = get_face_edge_normal_vectors(cur_pos, cur_mesh, edge_dofs);
 
     // draw energy terms
-    std::vector<double> bending_scalars = stvk_dir_energy_model->elasticEnergyPerElement(cur_pos, cur_edge_dofs, false, true);
+    std::vector<double> bending_scalars =
+        stvk_dir_energy_model->elasticEnergyPerElement(cur_pos, cur_edge_dofs, false, true);
     std::vector<double> stretching_scalars =
         stvk_dir_energy_model->elasticEnergyPerElement(cur_pos, cur_edge_dofs, true, false);
-    
+
     auto bending_plot = cur_surface_mesh->addFaceScalarQuantity("bending", bending_scalars);
     bending_plot->setMapRange({*std::min_element(bending_scalars.begin(), bending_scalars.end()),
-                                     *std::max_element(bending_scalars.begin(), bending_scalars.end())});
+                               *std::max_element(bending_scalars.begin(), bending_scalars.end())});
 
     auto stretching_plot = cur_surface_mesh->addFaceScalarQuantity("stretching", stretching_scalars);
     stretching_plot->setMapRange({*std::min_element(stretching_scalars.begin(), stretching_scalars.end()),
@@ -474,14 +564,15 @@ void update_rendering(polyscope::SurfaceMesh* cur_surface_mesh, polyscope::Point
     for (int i = 0; i < cur_mesh.nFaces(); i++) {
         perp_scalars.push_back(extra_energy_terms->compute_vector_perp_tangent_energy_perface(
             cur_pos, edge_dofs, cur_mesh, rest_state.abars, i, nullptr, nullptr, false));
-        III_scalars.push_back(extra_energy_terms->compute_thirdFundamentalForm_energy_perface(cur_pos, edge_dofs, cur_mesh, rest_state.abars, i, nullptr, nullptr, false));
+        III_scalars.push_back(extra_energy_terms->compute_thirdFundamentalForm_energy_perface(
+            cur_pos, edge_dofs, cur_mesh, rest_state.abars, i, nullptr, nullptr, false));
     }
     auto scalar_plot = cur_surface_mesh->addFaceScalarQuantity("perp", perp_scalars);
     scalar_plot->setMapRange({*std::min_element(perp_scalars.begin(), perp_scalars.end()),
-                                     *std::max_element(perp_scalars.begin(), perp_scalars.end())});
+                              *std::max_element(perp_scalars.begin(), perp_scalars.end())});
     auto III_plot = cur_surface_mesh->addFaceScalarQuantity("III", III_scalars);
     III_plot->setMapRange({*std::min_element(III_scalars.begin(), III_scalars.end()),
-                                     *std::max_element(III_scalars.begin(), III_scalars.end())});
+                           *std::max_element(III_scalars.begin(), III_scalars.end())});
 
     auto vec_quantity = pt_mesh->addVectorQuantity(model_name + " Edge Normals", face_edge_normals);
     vec_quantity->setEnabled(true);
@@ -493,12 +584,11 @@ struct InputArgs {
     double poisson = 0.3;
     int sff_model = 0;  // 0 for s1 and 2 for s2
     int material = 1;   // 0 for StVK and 1 for NeoHookean
-    bool delaunlay_mesh = false;
-    double twist_angle = 10;
+    bool with_gui = false;
+    std::string output_dir = "";
 };
 
-SFFModelType parseModelType(int type)
-{
+SFFModelType parseModelType(int type) {
     if (type == 0)
         return SFFModelType::kS1Sin;
     else if (type == 1)
@@ -513,58 +603,67 @@ SFFModelType parseModelType(int type)
 
 int main(int argc, char* argv[]) {
     InputArgs args;
-    CLI::App app{"Shell Energy Model"};
+    CLI::App app{"Shell Energy Model: Punched Disk Demo"};
     app.add_option("-t,--thickness", args.thickness, "Thickness of the shell");
     app.add_option("-a,--triangle_area", args.triangle_area, "Relative triangle area of the mesh");
     app.add_option("-s,--sff_model", args.sff_model, "SFF model type");
     app.add_option("-m, --material", args.material, "Material type");
-    app.add_flag("-d,--delaunay", args.delaunlay_mesh, "Cylinder with delaunay mesh");
-    app.add_option("--twisted_angle", args.twist_angle, "Twisted angle of the cylinder");
     app.add_option("-p, --poisson", args.poisson, "Poisson ratio of the material");
+    app.add_option("-o, --output_dir", args.output_dir, "Output directory");
+    app.add_flag("-g, --with_gui", args.with_gui, "Whether to show the GUI");
     CLI11_PARSE(app, argc, argv);
 
     double triangle_area = 0.002;
     if (args.triangle_area > 0) {
         triangle_area = args.triangle_area;
     }
-    double thickness = 1.0;
-    if (args.thickness > 0) {
-        thickness = args.thickness;
-    }
 
-    double twist_angle = 10;
-    if (args.twist_angle > 0 && args.twist_angle < 90) {
-        twist_angle = args.twist_angle;
+    if (args.thickness > 0) {
+        shell_thickness = args.thickness;
     }
 
     SFFModelType sff_type = parseModelType(args.sff_model);
-    
+
     MaterialType material_type = args.material == 0 ? MaterialType::kStVK : MaterialType::kNeoHookean;
 
-    double cylinder_radius = 0.2;
-    double cylinder_height = 1;
+    double inner_radius = 0.1;
+    double middle_radius = 0.4;
+    double outer_radius = 0.5;
 
     // set up material parameters
-    double young = 1;
-    //1e7;
+    double young = 1e7;
     double poisson = 0.3;
     if (args.poisson > 0 && args.poisson < 1) {
         poisson = args.poisson;
     }
     double shear = young / (2.0 * (1.0 + poisson));
 
-    Eigen::MatrixXd flatV, untwistedV, rolledV, rolledV_init;
-    Eigen::MatrixXi F, rolledF;
+    Eigen::MatrixXd flatV, V3d, V3d_init;
+    Eigen::MatrixXi F, F3d;
 
-    makeTwistedCylinderWithoutSeam(!args.delaunlay_mesh, cylinder_radius, cylinder_height,
-                              triangle_area * 2 * M_PI * cylinder_radius * cylinder_height, flatV, F, rolledV, rolledF,
-                              twist_angle / 180.0 * M_PI);
+    makePunchedDisk(inner_radius, middle_radius, outer_radius, triangle_area, flatV, F);
 
-    makeTwistedCylinderWithoutSeam(!args.delaunlay_mesh, cylinder_radius, cylinder_height,
-                          triangle_area * 2 * M_PI * cylinder_radius * cylinder_height, flatV, F, untwistedV, rolledF,
-                          0);
-    igl::writeOBJ("cylinder_twisted.obj", rolledV, rolledF);
-    rolledV_init = rolledV;
+    auto set_up_initial_positions = [&]() {
+        V3d = flatV;
+        F3d = F;
+
+        for (int i = 0; i < flatV.rows(); i++) {
+            double r = flatV.row(i).norm();
+            // inner radius -> target_height
+            // middle radius -> 0
+            if (r <= inner_radius) {
+                V3d(i, 2) = target_height;
+            } else if (r >= middle_radius) {
+                V3d(i, 2) = 0;
+            } else {
+                V3d(i, 2) = -target_height * (r - inner_radius) / (middle_radius - inner_radius) + target_height;
+            }
+        }
+
+        V3d_init = V3d;
+    };
+
+    set_up_initial_positions();
 
     Eigen::VectorXd edge_dofs;
     LibShell::MonolayerRestState rest_state;
@@ -577,14 +676,18 @@ int main(int argc, char* argv[]) {
     std::string model_name = "";
     std::string material_name = "";
 
-    std::string prefix_name = "";
+    std::string prefix_name = args.output_dir;
+    std::string gui_prefix_name = "";
+    std::string results_dir = "";
 
     auto initialize_all = [&]() {
         rest_mesh = LibShell::MeshConnectivity(F);
-        cur_mesh = LibShell::MeshConnectivity(rolledF);
-        std::tie(dir_energy_model, extra_energy_terms) = initialization(rest_mesh, flatV, cur_mesh, thickness, young, poisson, edge_dofs, rest_state, sff_type, material_type);
+        cur_mesh = LibShell::MeshConnectivity(F3d);
+        std::tie(dir_energy_model, extra_energy_terms) =
+            initialization(rest_mesh, flatV, cur_mesh, shell_thickness, young, poisson, edge_dofs, rest_state, sff_type,
+                           material_type);
         reinitialization = false;
-        rolledV = rolledV_init;
+        V3d = V3d_init;
 
         switch (sff_type) {
             case SFFModelType::kS1Sin: {
@@ -617,133 +720,260 @@ int main(int argc, char* argv[]) {
                 break;
             }
         }
+        gui_prefix_name = model_name + material_name + " ";
+        if (!args.output_dir.empty()) {
+            prefix_name = args.output_dir;
+            if (!std::filesystem::exists(prefix_name)) {
+                try {
+                    std::filesystem::create_directories(prefix_name);
+                } catch (const std::filesystem::filesystem_error& e) {
+                    std::cerr << "Failed to create output directory: " << e.what() << std::endl;
+                    std::cerr << "Using current directory instead." << std::endl;
+                    prefix_name = ".";
+                }
+            }
+            prefix_name +=
+                "/" + material_name + "/V_" + std::to_string(flatV.rows()) + "_h_" + std::to_string(shell_thickness);
+        } else {
+            prefix_name =
+                material_name + "/V_" + std::to_string(flatV.rows()) + "_h_" + std::to_string(shell_thickness);
+        }
 
-        prefix_name = material_name + "_" + model_name;
+        prefix_name += "/" + model_name;
+
+        fixed_verts.clear();
+        std::vector<std::vector<int>> boundary_loops;
+        igl::boundary_loop(F, boundary_loops);
+        for (int i = 0; i < boundary_loops.size(); i++) {
+            for (int j = 0; j < boundary_loops[i].size(); j++) {
+                fixed_verts.push_back(boundary_loops[i][j]);
+            }
+        }
+
+        constexpr double PI = 3.1415926535898;
+        double abs_triangle_area = PI * outer_radius * outer_radius * triangle_area;
+        double targetlength = 2.0 * std::sqrt(abs_triangle_area / std::sqrt(3.0));
+
+        int middle_samples = std::max(3, int(2 * PI * middle_radius / targetlength));
+
+        for (int i = 0; i < flatV.rows(); i++) {
+            double r = flatV.row(i).norm();
+            double middle_radius_ratio = std::cos(PI / middle_samples) * middle_radius;
+            if (r >= middle_radius_ratio * (1 - 1e-5)) {
+                fixed_verts.push_back(i);
+            }
+        }
+
+        // make a directory for the results
+        results_dir = prefix_name;
+        if (!results_dir.empty()) {
+            try {
+                std::filesystem::create_directories(results_dir);
+            } catch (const std::filesystem::filesystem_error& e) {
+                std::cerr << "Failed to create directory: " << e.what() << std::endl;
+                std::cerr << "Will use current directory instead." << std::endl;
+                results_dir = ".";
+            }
+        }
     };
 
-    polyscope::init();
-    polyscope::SurfaceMesh* surface_mesh = nullptr, *untwisted_surface_mesh = nullptr;
-    polyscope::SurfaceMesh* init_surface_mesh = nullptr;
-    polyscope::PointCloud* pt_mesh = nullptr, *init_pt_mesh = nullptr;
-
-    auto initialize_rendering = [&]() {
-        untwisted_surface_mesh = polyscope::registerSurfaceMesh(prefix_name + "Untwisted mesh", untwistedV, rolledF);
-        untwisted_surface_mesh->setEnabled(false);
-        surface_mesh = polyscope::registerSurfaceMesh(prefix_name + "Current mesh", rolledV, rolledF);
-        init_surface_mesh = polyscope::registerSurfaceMesh(prefix_name + "Initial mesh", rolledV_init, rolledF);
-        init_surface_mesh->setEnabled(false);
-
-        std::vector<Eigen::Vector3d> face_edge_midpts = {};
-        for (int i = 0; i < cur_mesh.nFaces(); i++) {
-            for (int j = 0; j < 3; j++) {
-                int eid = cur_mesh.faceEdge(i, j);
-                Eigen::Vector3d midpt =
-                    (rolledV.row(cur_mesh.edgeVertex(eid, 0)) + rolledV.row(cur_mesh.edgeVertex(eid, 1))) / 2.0;
-                face_edge_midpts.push_back(midpt);
+    if (!args.with_gui) {
+        initialize_all();
+        // save the initial configuration
+        std::ofstream initial_config_file(results_dir + "/initial_config.txt");
+        initial_config_file << "shell_thickness: " << shell_thickness << std::endl;
+        initial_config_file << "triangle_area: " << triangle_area << std::endl;
+        initial_config_file << "sff_type: ";
+        switch (sff_type) {
+            case SFFModelType::kS1Sin: {
+                initial_config_file << "S1 sin";
+                break;
+            }
+            case SFFModelType::kS1Tan: {
+                initial_config_file << "S1 tan";
+                break;
+            }
+            case SFFModelType::kS2Sin: {
+                initial_config_file << "S2 sin";
+                break;
+            }
+            default: {
+                break;
             }
         }
-
-        pt_mesh = polyscope::registerPointCloud(prefix_name + "Face edge midpoints", face_edge_midpts);
-        init_pt_mesh = polyscope::registerPointCloud(prefix_name + "Initial Face edge midpoints", face_edge_midpts);
-        init_pt_mesh->setEnabled(false);
-    };
-
-    initialize_all();
-    initialize_rendering();
-
-    update_rendering(init_surface_mesh, init_pt_mesh, dir_energy_model, extra_energy_terms, cur_mesh, rest_state, rolledV,
-                     edge_dofs, sff_type);
-    update_rendering(surface_mesh, pt_mesh, dir_energy_model, extra_energy_terms, cur_mesh, rest_state, rolledV,
-                    edge_dofs, sff_type);
-
-
-    polyscope::state::userCallback = [&]() {
-        if (ImGui::InputDouble("Triangle Area", &triangle_area)) {
-            if (triangle_area <= 0) {
-                triangle_area = 0.02;
+        initial_config_file << std::endl;
+        initial_config_file << "material_type: ";
+        switch (material_type) {
+            case MaterialType::kStVK: {
+                initial_config_file << "StVK";
+                break;
             }
-            reinitialization = true;
-        }
-
-        if (ImGui::InputDouble("Thickness", &thickness)) {
-            if (thickness <= 0) {
-                thickness = 0.001;
+            case MaterialType::kNeoHookean: {
+                initial_config_file << "NeoHookean";
+                break;
             }
-            reinitialization = true;
-        }
-
-        if (ImGui::InputDouble("Twist Angle", &twist_angle)) {
-            if (twist_angle <= 0) {
-                twist_angle = 10;
+            default: {
+                break;
             }
-            reinitialization = true;
         }
+        initial_config_file << std::endl;
+        initial_config_file << "young: " << young << std::endl;
+        initial_config_file << "poisson: " << poisson << std::endl;
+        initial_config_file.close();
 
-        if (ImGui::InputDouble("Poisson", &poisson)) {
-            if (poisson < 0) {
-                poisson = 0.3;
+        OptimizationLog opt_log = processFullModelOneStep(rest_mesh, rest_state, cur_mesh, dir_energy_model,
+                                                          extra_energy_terms, V3d, edge_dofs, sff_type);
+        igl::writeOBJ(results_dir + "/rest_mesh.obj", flatV, F);
+        igl::writeOBJ(results_dir + "/converged_mesh.obj", V3d, F3d);
+
+        // save edge dofs as a text file
+        std::ofstream edge_dofs_file(results_dir + "/edge_dofs.txt");
+        for (int i = 0; i < edge_dofs.size(); i++) {
+            edge_dofs_file << edge_dofs(i) << std::endl;
+        }
+        edge_dofs_file.close();
+
+        opt_log.save(results_dir + "/optimization_log.txt");
+    } else {
+        polyscope::init();
+        polyscope::SurfaceMesh* surface_mesh = nullptr;
+        polyscope::SurfaceMesh* init_surface_mesh = nullptr;
+        polyscope::PointCloud *pt_mesh = nullptr, *init_pt_mesh = nullptr;
+
+        auto initialize_rendering = [&]() {
+            surface_mesh = polyscope::registerSurfaceMesh(gui_prefix_name + "Current mesh", V3d, F3d);
+            surface_mesh->setEnabled(true);
+            init_surface_mesh = polyscope::registerSurfaceMesh(gui_prefix_name + "Initial mesh", V3d_init, F3d);
+            init_surface_mesh->setEnabled(false);
+
+            auto flat_surface_mesh = polyscope::registerSurfaceMesh(gui_prefix_name + "Rest mesh", flatV, F);
+            flat_surface_mesh->setEnabled(false);
+
+            std::vector<Eigen::Vector3d> face_edge_midpts = {};
+            for (int i = 0; i < cur_mesh.nFaces(); i++) {
+                for (int j = 0; j < 3; j++) {
+                    int eid = cur_mesh.faceEdge(i, j);
+                    Eigen::Vector3d midpt =
+                        (V3d.row(cur_mesh.edgeVertex(eid, 0)) + V3d.row(cur_mesh.edgeVertex(eid, 1))) / 2.0;
+                    face_edge_midpts.push_back(midpt);
+                }
             }
-            reinitialization = true;
-        }
 
-        if (ImGui::Combo("Material Type", &args.material, "StVK\0NeoHookean\0")) {
-            material_type = args.material == 0 ? MaterialType::kStVK : MaterialType::kNeoHookean;
-            initialize_all();
-            initialize_rendering();
-            update_rendering(init_surface_mesh, init_pt_mesh, dir_energy_model, extra_energy_terms, cur_mesh, rest_state, rolledV,
-             edge_dofs, sff_type);
-            rolledV = rolledV_init;
-        }
+            pt_mesh = polyscope::registerPointCloud(gui_prefix_name + "Face edge midpoints", face_edge_midpts);
+            pt_mesh->setEnabled(true);
+            init_pt_mesh = polyscope::registerPointCloud(gui_prefix_name + "Initial Face edge midpoints", face_edge_midpts);
+            init_pt_mesh->setEnabled(false);
 
-        if (ImGui::Combo("Bending Type", &args.sff_model, "S1 Sin\0S1 Tan\0S2 Sin\0")) {
-            sff_type = parseModelType(args.sff_model);
-            initialize_all();
-            initialize_rendering();
-            update_rendering(init_surface_mesh, init_pt_mesh, dir_energy_model, extra_energy_terms, cur_mesh, rest_state, rolledV,
-             edge_dofs, sff_type);
-            rolledV = rolledV_init;
-        }
+            std::vector<Eigen::Vector3d> fixed_verts_pos;
+            for (int i = 0; i < fixed_verts.size(); i++) {
+                fixed_verts_pos.push_back(V3d.row(fixed_verts[i]));
+            }
+            auto fixed_pt_mesh = polyscope::registerPointCloud(gui_prefix_name + "Fixed verts", fixed_verts_pos);
+            fixed_pt_mesh->setEnabled(false);
+        };
 
-        ImGui::Checkbox("Include III", &is_include_III);
+        initialize_all();
+        initialize_rendering();
 
-        if (ImGui::Button("Remake Cylinder", ImVec2(-1, 0))) {
-            double actual_triangle_area = triangle_area * 2 * M_PI * cylinder_radius * cylinder_height;
-            makeTwistedCylinderWithoutSeam(!args.delaunlay_mesh, cylinder_radius, cylinder_height, actual_triangle_area,
-                                           flatV, F, rolledV, rolledF, twist_angle / 180.0 * M_PI);
-
-            makeTwistedCylinderWithoutSeam(!args.delaunlay_mesh, cylinder_radius, cylinder_height, actual_triangle_area,
-                                           flatV, F, untwistedV, rolledF, 0);
-            rolledV_init = rolledV;
-            reinitialization = true;
-            initialize_all();
-            initialize_rendering();
-            update_rendering(init_surface_mesh, init_pt_mesh, dir_energy_model, extra_energy_terms, cur_mesh, rest_state, rolledV,
+        update_rendering(init_surface_mesh, init_pt_mesh, dir_energy_model, extra_energy_terms, cur_mesh, rest_state,
+                         V3d, edge_dofs, sff_type);
+        update_rendering(surface_mesh, pt_mesh, dir_energy_model, extra_energy_terms, cur_mesh, rest_state, V3d,
                          edge_dofs, sff_type);
-        }
 
-        if(ImGui::InputInt("Number of Iterations", &num_iters)) {
-            if(num_iters <= 0) {
-                num_iters = 200;
+        polyscope::state::userCallback = [&]() {
+            if (ImGui::InputDouble("Triangle Area", &triangle_area)) {
+                if (triangle_area <= 0) {
+                    triangle_area = 0.02;
+                }
+                reinitialization = true;
             }
-        }
 
-        if (ImGui::Button("Optimize", ImVec2(-1, 0)) ) {
-            if (reinitialization) {
+            if (ImGui::InputDouble("Thickness", &shell_thickness)) {
+                if (shell_thickness <= 0) {
+                    shell_thickness = 0.001;
+                }
+                reinitialization = true;
+            }
+
+            if (ImGui::InputDouble("Target Height", &target_height)) {
+                if (target_height <= 0) {
+                    target_height = 0.2;
+                }
+                reinitialization = true;
+            }
+
+            if (ImGui::InputDouble("Poisson", &poisson)) {
+                if (poisson < 0) {
+                    poisson = 0.3;
+                }
+                reinitialization = true;
+            }
+
+            if (ImGui::Combo("Material Type", &args.material, "StVK\0NeoHookean\0")) {
+                material_type = args.material == 0 ? MaterialType::kStVK : MaterialType::kNeoHookean;
                 initialize_all();
+                initialize_rendering();
+
+                update_rendering(init_surface_mesh, init_pt_mesh, dir_energy_model, extra_energy_terms, cur_mesh,
+                                 rest_state, V3d, edge_dofs, sff_type);
             }
-            processFullModelOneStep(rest_mesh, rest_state, cur_mesh, dir_energy_model, extra_energy_terms,
-                                    rolledV, edge_dofs, sff_type);
 
-            update_rendering(surface_mesh, pt_mesh, dir_energy_model, extra_energy_terms, cur_mesh, rest_state,
-                             rolledV, edge_dofs, sff_type);
+            if (ImGui::Combo("Bending Type", &args.sff_model, "S1 Sin\0S1 Tan\0S2 Sin\0")) {
+                sff_type = parseModelType(args.sff_model);
+                initialize_all();
+                initialize_rendering();
 
-            polyscope::refresh();
-            polyscope::requestRedraw();
-        }
-    };
+                update_rendering(init_surface_mesh, init_pt_mesh, dir_energy_model, extra_energy_terms, cur_mesh,
+                                 rest_state, V3d, edge_dofs, sff_type);
+            }
 
-    polyscope::show();
+            ImGui::Checkbox("Include III", &is_include_III);
 
+            if (ImGui::Button("Remake Disk", ImVec2(-1, 0))) {
+                makePunchedDisk(inner_radius, middle_radius, outer_radius, triangle_area, flatV, F);
+                set_up_initial_positions();
+                reinitialization = true;
+                initialize_all();
+                initialize_rendering();
+                update_rendering(init_surface_mesh, init_pt_mesh, dir_energy_model, extra_energy_terms, cur_mesh,
+                                 rest_state, V3d, edge_dofs, sff_type);
+            }
+
+            if (ImGui::InputInt("Number of Newton Iters", &num_iters)) {
+                if (num_iters <= 0) {
+                    num_iters = 200;
+                }
+            }
+            if (ImGui::Button("Reset", ImVec2(-1, 0))) {
+                V3d = V3d_init;
+                edge_dofs = edge_dofs;
+                update_rendering(surface_mesh, pt_mesh, dir_energy_model, extra_energy_terms, cur_mesh, rest_state, V3d,
+                                 edge_dofs, sff_type);
+            }
+
+            if (ImGui::Button("Punch", ImVec2(-1, 0))) {
+                if (reinitialization) {
+                    initialize_all();
+                }
+                OptimizationLog opt_log = processFullModelOneStep(rest_mesh, rest_state, cur_mesh, dir_energy_model,
+                                                                  extra_energy_terms, V3d, edge_dofs, sff_type);
+                update_rendering(surface_mesh, pt_mesh, dir_energy_model, extra_energy_terms, cur_mesh, rest_state, V3d,
+                                 edge_dofs, sff_type);
+
+                igl::writeOBJ(results_dir + "/converged_mesh.obj", V3d, F3d);
+
+                // save edge dofs as a text file
+                std::ofstream edge_dofs_file(results_dir + "/edge_dofs.txt");
+                for (int i = 0; i < edge_dofs.size(); i++) {
+                    edge_dofs_file << edge_dofs(i) << std::endl;
+                }
+                edge_dofs_file.close();
+
+                opt_log.save(results_dir + "/optimization_log.txt");
+            }
+        };
+
+        polyscope::show();
+    }
     return 0;
 }
-
